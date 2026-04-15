@@ -1,0 +1,91 @@
+name: App Build & Infra Plan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request: # Good practice to run plans on PRs
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: 'Environment to run plan against'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prd
+
+jobs:
+  build:
+    name: Build & Mock Push Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set_tag.outputs.tag }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - id: set_tag
+        run: echo "tag=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build
+        run: docker build -t demo-app:${{ steps.set_tag.outputs.tag }} ./app
+
+  terraform:
+    name: Terraform Plan
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      # Use input if manual, otherwise default to dev for push/PR
+      ENVIRONMENT: ${{ github.event.inputs.target_env || 'dev' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2 # Stable version
+        with:
+          terraform_version: "1.5.0"
+
+      - name: Terraform Init
+        working-directory: environments/${{ env.ENVIRONMENT }}
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: environments/${{ env.ENVIRONMENT }}
+        run: |
+          terraform plan -no-color \
+            -var="container_image=demo-app:${{ needs.build.outputs.image_tag }}" \
+            -out=tfplan.binary
+        continue-on-error: true
+            
+      - name: Post Plan to PR
+        uses: actions/github-script@v6
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Plan (Env: ${{ env.ENVIRONMENT }}) 📖
+            #### Build Tag: \`${{ needs.build.outputs.image_tag }}\`
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`${process.env.PLAN}\`\`\`
+            
+            </details>
+            
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
